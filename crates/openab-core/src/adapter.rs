@@ -48,6 +48,23 @@ fn resolve_streaming(platform: &str, adapter_prefers_streaming: bool) -> bool {
         && adapter_prefers_streaming
 }
 
+/// Resolve a first-message `[[ws:@alias]]` directive in `prompt` to a
+/// working-directory override, mirroring `dispatch_batch`. Returns `None` when
+/// no directive is present or it fails to resolve. `handle_message`
+/// (per-message / cron mode) uses this so those paths pin the workspace like
+/// batched mode — without it, cron-triggered sessions start in the bot home.
+fn resolve_workspace_override(
+    prompt: &str,
+    aliases: &std::collections::HashMap<String, String>,
+    bot_home: &std::path::Path,
+) -> Option<String> {
+    let parsed = crate::directives::parse_directives(prompt);
+    let ws_value = parsed.metadata.raw.get("ws")?;
+    crate::directives::resolve_workspace(ws_value, aliases, bot_home)
+        .ok()
+        .map(|p| p.display().to_string())
+}
+
 /// Parse `[[key:value]]` directives from the beginning of agent output.
 /// Returns parsed directives and the remaining content (directives stripped).
 pub fn parse_output_directives(content: &str) -> (OutputDirectives, String) {
@@ -609,7 +626,22 @@ impl AdapterRouter {
                 .unwrap_or(&ctx.thread_channel.channel_id)
         );
 
-        if let Err(e) = self.pool.get_or_create(&thread_key, None).await {
+        // Resolve a first-message [[ws:@alias]] directive so per-message / cron
+        // mode pins the workspace like dispatch_batch does. get_or_create ignores
+        // the working_dir for an already-existing session, so this only takes
+        // effect on session creation (matching batched-mode semantics); without
+        // it, cron-triggered sessions start in the bot home and lose the repo.
+        let workspace_override = resolve_workspace_override(
+            &ctx.prompt,
+            &self.workspace_aliases_map(),
+            &self.bot_home_path(),
+        );
+
+        if let Err(e) = self
+            .pool
+            .get_or_create(&thread_key, workspace_override.as_deref())
+            .await
+        {
             let msg = format_user_error(&e.to_string());
             let _ = adapter
                 .send_message(&ctx.thread_channel, &format!("⚠️ {msg}"))
@@ -1770,6 +1802,28 @@ mod tests {
         assert!(!resolve_streaming("googlechat", true));
         // LINE: no edit API → send-once.
         assert!(!resolve_streaming("line", true));
+    }
+
+    #[test]
+    fn resolve_workspace_override_resolves_ws_alias() {
+        let bot_home = std::env::temp_dir().canonicalize().unwrap();
+        let ws = bot_home.join("oab-ws-override-test");
+        std::fs::create_dir_all(&ws).unwrap();
+        let aliases = std::collections::HashMap::from([(
+            "play".to_string(),
+            "~/oab-ws-override-test".to_string(),
+        )]);
+        // Directive present → resolves to the alias's (existing) dir.
+        let out = resolve_workspace_override("[[ws:@play]] review PR #476", &aliases, &bot_home);
+        assert!(
+            out.as_deref().is_some_and(|p| p.contains("oab-ws-override-test")),
+            "expected @play to resolve, got {out:?}"
+        );
+        // No directive → None (session keeps the default working dir).
+        assert!(resolve_workspace_override("review PR #476", &aliases, &bot_home).is_none());
+        // Unknown alias → None (resolution fails gracefully).
+        assert!(resolve_workspace_override("[[ws:@nope]] x", &aliases, &bot_home).is_none());
+        std::fs::remove_dir_all(&ws).ok();
     }
 
     #[test]
