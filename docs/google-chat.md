@@ -74,7 +74,7 @@ Google Chat uses a service account to authenticate outbound API calls (bot repli
 
 ## 3. Configure the Gateway
 
-The gateway supports two authentication methods for sending replies:
+The gateway supports three authentication methods for sending replies:
 
 ### Option A: Service Account Key (recommended — auto-refresh)
 
@@ -111,6 +111,24 @@ docker run -d --name openab-gateway \
   -p 8080:8080 \
   ghcr.io/openabdev/openab-gateway:latest
 ```
+
+### Option C: Keyless ADC (recommended on GCP — no key file)
+
+When the gateway runs on GCP (GKE / GCE / Cloud Run) **as** a service account, it can mint the `chat.bot` token from that identity — no service-account key file to mount, manage, or leak. The gateway reads a base token from the GCE metadata server and calls IAM Credentials `generateAccessToken` (the SA impersonates itself) for a `chat.bot`-scoped token, then caches and auto-refreshes it.
+
+Prerequisites:
+
+- The workload's service account **is** the Chat app's service account (the identity that sends must be the space member).
+- Grant that SA `roles/iam.serviceAccountTokenCreator` **on itself**.
+- Enable `iamcredentials.googleapis.com`.
+
+```bash
+# The pod/VM already runs as the target service account; no key is mounted.
+export GOOGLE_CHAT_ENABLED=true
+export GOOGLE_CHAT_USE_ADC=true
+```
+
+Precedence: if a SA key (`GOOGLE_CHAT_SA_KEY_JSON` / `GOOGLE_CHAT_SA_KEY_FILE`) is also set, the SA key wins and ADC is ignored.
 
 ### Local development
 

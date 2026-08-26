@@ -1,6 +1,10 @@
 # --- Build stage ---
 FROM rust:1-bookworm AS builder
 WORKDIR /build
+# Extra cargo features to compile into the openab binary (space-separated,
+# added on top of the default set). Empty = default (discord+slack+core).
+# The reviewer image passes "googlechat" to enable the Google Chat adapter.
+ARG OPENAB_BUILD_FEATURES=""
 COPY Cargo.toml Cargo.lock ./
 COPY crates/openab-core/Cargo.toml crates/openab-core/Cargo.toml
 COPY crates/openab-gateway/Cargo.toml crates/openab-gateway/Cargo.toml
@@ -12,11 +16,11 @@ RUN mkdir -p src crates/openab-core/src crates/openab-gateway/src crates/openab-
     && echo '' > crates/openab-gateway/src/lib.rs \
     && echo '' > crates/openab-mcp/src/lib.rs \
     && echo '' > crates/openab-cp/src/lib.rs \
-    && cargo build --release \
+    && cargo build --release ${OPENAB_BUILD_FEATURES:+--features "$OPENAB_BUILD_FEATURES"} \
     && rm -rf src crates/openab-core/src crates/openab-gateway/src crates/openab-mcp/src crates/openab-cp/src
 COPY crates/ crates/
 COPY src/ src/
-RUN touch src/main.rs crates/openab-core/src/lib.rs crates/openab-gateway/src/lib.rs crates/openab-mcp/src/lib.rs crates/openab-cp/src/lib.rs && cargo build --release
+RUN touch src/main.rs crates/openab-core/src/lib.rs crates/openab-gateway/src/lib.rs crates/openab-mcp/src/lib.rs crates/openab-cp/src/lib.rs && cargo build --release ${OPENAB_BUILD_FEATURES:+--features "$OPENAB_BUILD_FEATURES"}
 
 # --- Runtime stage ---
 FROM node:22-trixie-slim

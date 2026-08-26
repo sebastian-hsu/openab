@@ -263,6 +263,7 @@ impl GoogleChatJwtVerifier {
 
 pub struct GoogleChatAdapter {
     pub token_cache: Option<GoogleChatTokenCache>,
+    pub metadata_source: Option<MetadataTokenSource>,
     pub access_token: Option<String>,
     pub jwt_verifier: Option<GoogleChatJwtVerifier>,
     pub client: reqwest::Client,
@@ -271,13 +272,16 @@ pub struct GoogleChatAdapter {
 
 impl GoogleChatAdapter {
     /// Build an adapter from resolved parts (#1379): SA key JSON (inline wins
-    /// over file path), optional static access token, optional JWT audience.
+    /// over file path), optional static access token, optional JWT audience,
+    /// and `use_adc` (keyless ADC via the GCE metadata server + IAM
+    /// Credentials). Auth precedence at send time: SA key > ADC > static token.
     /// Shared by env-derived construction and `apply_googlechat_config`.
     pub(crate) fn from_parts(
         sa_key_json: Option<String>,
         sa_key_file: Option<String>,
         access_token: Option<String>,
         audience: Option<String>,
+        use_adc: bool,
     ) -> Self {
         use tracing::{info, warn};
         let token_cache = sa_key_json
@@ -299,7 +303,14 @@ impl GoogleChatAdapter {
             info!("googlechat webhook JWT verification enabled (audience={aud})");
             GoogleChatJwtVerifier::new(aud)
         });
-        Self::new(token_cache, access_token, jwt_verifier)
+        // ADC only when no SA key was resolved (SA key takes precedence); when
+        // both are configured the token_cache path in `get_token` runs first.
+        if use_adc && token_cache.is_none() {
+            info!("googlechat keyless ADC enabled (chat.bot via IAM Credentials)");
+        }
+        let mut adapter = Self::new(token_cache, access_token, jwt_verifier);
+        adapter.metadata_source = use_adc.then(MetadataTokenSource::new);
+        adapter
     }
 
     pub fn new(
@@ -309,6 +320,7 @@ impl GoogleChatAdapter {
     ) -> Self {
         Self {
             token_cache,
+            metadata_source: None,
             access_token,
             jwt_verifier,
             client: reqwest::Client::new(),
@@ -322,6 +334,15 @@ impl GoogleChatAdapter {
                 Ok(t) => return Some(t),
                 Err(e) => {
                     error!("googlechat token refresh failed: {e}");
+                    return None;
+                }
+            }
+        }
+        if let Some(ref src) = self.metadata_source {
+            match src.get_token(&self.client).await {
+                Ok(t) => return Some(t),
+                Err(e) => {
+                    error!("googlechat ADC token mint failed: {e}");
                     return None;
                 }
             }
@@ -879,6 +900,160 @@ impl GoogleChatTokenCache {
         let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
         jsonwebtoken::encode(&header, &claims, &key)
             .map_err(|e| format!("JWT encode error: {e}"))
+    }
+}
+
+// --- Keyless ADC token source (GCE metadata → IAM Credentials) ---
+
+/// Google Chat's `chat.bot` scope for the minted token.
+const ADC_CHAT_BOT_SCOPE: &str = "https://www.googleapis.com/auth/chat.bot";
+/// Lifetime we request from IAM Credentials for the impersonated token, and
+/// the fallback TTL we cache it under. IAM caps impersonated tokens at 3600s.
+const ADC_TOKEN_LIFETIME_SECS: u64 = 3600;
+
+/// Cache TTL (seconds) to use for a minted token, derived from the IAM
+/// response's `expireTime`. Falls back to the full lifetime when the field is
+/// missing/unparseable, and clamps to `[0, ADC_TOKEN_LIFETIME_SECS]` so an
+/// org-policy-shortened token isn't cached past its real expiry (0 forces a
+/// fresh mint next call rather than serving a dead token).
+fn ttl_from_expire_time(expire_time: &str, now: chrono::DateTime<chrono::Utc>) -> u64 {
+    match chrono::DateTime::parse_from_rfc3339(expire_time) {
+        Ok(exp) => (exp.with_timezone(&chrono::Utc) - now)
+            .num_seconds()
+            .clamp(0, ADC_TOKEN_LIFETIME_SECS as i64) as u64,
+        Err(_) => ADC_TOKEN_LIFETIME_SECS,
+    }
+}
+
+/// Mints a `chat.bot`-scoped access token **without** a service-account key
+/// file, using the workload's own identity (keyless ADC). Flow, per refresh:
+///   1. read the default SA's email + a base token from the GCE metadata server
+///   2. call IAM Credentials `generateAccessToken` (self-impersonation) to
+///      exchange the base token for a `chat.bot`-scoped token
+///
+/// Requires `roles/iam.serviceAccountTokenCreator` on the SA over itself and
+/// the `iamcredentials.googleapis.com` API enabled. The `*_base` fields are
+/// overridable so tests can point them at a mock server.
+pub struct MetadataTokenSource {
+    token: RwLock<Option<(String, Instant, u64)>>,
+    pub metadata_base: String,
+    pub iam_credentials_base: String,
+}
+
+impl Default for MetadataTokenSource {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl MetadataTokenSource {
+    pub fn new() -> Self {
+        Self {
+            token: RwLock::new(None),
+            metadata_base: "http://metadata.google.internal".into(),
+            iam_credentials_base: "https://iamcredentials.googleapis.com".into(),
+        }
+    }
+
+    /// Cached-or-refresh, mirroring [`GoogleChatTokenCache::get_token`]:
+    /// double-checked locking around the RwLock so only one refresh runs.
+    pub async fn get_token(&self, client: &reqwest::Client) -> Result<String, String> {
+        {
+            let guard = self.token.read().await;
+            if let Some((ref tok, ref ts, ttl)) = *guard {
+                if ts.elapsed().as_secs() < ttl.saturating_sub(TOKEN_REFRESH_MARGIN_SECS) {
+                    return Ok(tok.clone());
+                }
+            }
+        }
+        let mut guard = self.token.write().await;
+        if let Some((ref tok, ref ts, ttl)) = *guard {
+            if ts.elapsed().as_secs() < ttl.saturating_sub(TOKEN_REFRESH_MARGIN_SECS) {
+                return Ok(tok.clone());
+            }
+        }
+        let (token, ttl) = self.refresh(client).await?;
+        *guard = Some((token.clone(), Instant::now(), ttl));
+        info!("googlechat ADC token minted (chat.bot, ttl {ttl}s)");
+        Ok(token)
+    }
+
+    async fn refresh(&self, client: &reqwest::Client) -> Result<(String, u64), String> {
+        // 1. Default SA email from the GCE metadata server.
+        let email = client
+            .get(format!(
+                "{}/computeMetadata/v1/instance/service-accounts/default/email",
+                self.metadata_base
+            ))
+            .header("Metadata-Flavor", "Google")
+            .send()
+            .await
+            .map_err(|e| format!("metadata email request failed: {e}"))?
+            .error_for_status()
+            .map_err(|e| format!("metadata email status: {e}"))?
+            .text()
+            .await
+            .map_err(|e| format!("metadata email read failed: {e}"))?;
+        let email = email.trim();
+        if email.is_empty() {
+            return Err("metadata returned empty SA email".into());
+        }
+
+        // 2. Base access token for the default SA from the metadata server.
+        let base: serde_json::Value = client
+            .get(format!(
+                "{}/computeMetadata/v1/instance/service-accounts/default/token",
+                self.metadata_base
+            ))
+            .header("Metadata-Flavor", "Google")
+            .send()
+            .await
+            .map_err(|e| format!("metadata token request failed: {e}"))?
+            .error_for_status()
+            .map_err(|e| format!("metadata token status: {e}"))?
+            .json()
+            .await
+            .map_err(|e| format!("metadata token parse failed: {e}"))?;
+        let base_token = base
+            .get("access_token")
+            .and_then(|v| v.as_str())
+            .ok_or("metadata token response missing access_token")?;
+
+        // 3. Exchange the base token for a chat.bot-scoped token via IAM
+        //    Credentials generateAccessToken (the SA impersonates itself).
+        let url = format!(
+            "{}/v1/projects/-/serviceAccounts/{email}:generateAccessToken",
+            self.iam_credentials_base
+        );
+        let resp: serde_json::Value = client
+            .post(&url)
+            .bearer_auth(base_token)
+            .json(&serde_json::json!({
+                "scope": [ADC_CHAT_BOT_SCOPE],
+                "lifetime": format!("{ADC_TOKEN_LIFETIME_SECS}s"),
+            }))
+            .send()
+            .await
+            .map_err(|e| format!("generateAccessToken request failed: {e}"))?
+            .error_for_status()
+            .map_err(|e| format!("generateAccessToken status: {e}"))?
+            .json()
+            .await
+            .map_err(|e| format!("generateAccessToken parse failed: {e}"))?;
+        let token = resp
+            .get("accessToken")
+            .and_then(|v| v.as_str())
+            .ok_or("generateAccessToken response missing accessToken")?
+            .to_string();
+        // Cache under the server-granted lifetime (respects an org policy that
+        // shortens impersonated tokens below the requested 3600s), falling back
+        // to the full lifetime when expireTime is absent/unparseable.
+        let ttl = resp
+            .get("expireTime")
+            .and_then(|v| v.as_str())
+            .map(|e| ttl_from_expire_time(e, chrono::Utc::now()))
+            .unwrap_or(ADC_TOKEN_LIFETIME_SECS);
+        Ok((token, ttl))
     }
 }
 
@@ -1809,6 +1984,133 @@ mod tests {
         }"#;
         let result = GoogleChatTokenCache::new(key);
         assert!(result.is_ok());
+    }
+
+    // --- Keyless ADC (MetadataTokenSource) tests ---
+
+    #[test]
+    fn ttl_from_expire_time_derives_and_clamps() {
+        use chrono::{DateTime, Utc};
+        let now: DateTime<Utc> = "2026-08-25T00:00:00Z".parse().unwrap();
+        // Normal: 30 min out → 1800s.
+        assert_eq!(ttl_from_expire_time("2026-08-25T00:30:00Z", now), 1800);
+        // Beyond the 3600s cap → clamped to 3600.
+        assert_eq!(ttl_from_expire_time("2026-08-25T05:00:00Z", now), 3600);
+        // Already expired → 0 (forces refresh next call, never caches a dead token).
+        assert_eq!(ttl_from_expire_time("2026-08-24T23:00:00Z", now), 0);
+        // Unparseable → safe fallback to the full lifetime.
+        assert_eq!(ttl_from_expire_time("not-a-timestamp", now), 3600);
+    }
+
+    #[tokio::test]
+    async fn metadata_token_source_mints_chat_bot_token() {
+        use wiremock::matchers::{header, method, path, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        // GCE metadata: default SA email.
+        Mock::given(method("GET"))
+            .and(path(
+                "/computeMetadata/v1/instance/service-accounts/default/email",
+            ))
+            .and(header("Metadata-Flavor", "Google"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("openab-host@dev-seba.iam.gserviceaccount.com"),
+            )
+            .mount(&server)
+            .await;
+        // GCE metadata: base access token.
+        Mock::given(method("GET"))
+            .and(path(
+                "/computeMetadata/v1/instance/service-accounts/default/token",
+            ))
+            .and(header("Metadata-Flavor", "Google"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "base-tok",
+                "expires_in": 3600,
+                "token_type": "Bearer"
+            })))
+            .mount(&server)
+            .await;
+        // IAM Credentials: generateAccessToken (self-impersonation) → chat.bot token.
+        Mock::given(method("POST"))
+            .and(path_regex(
+                r"/v1/projects/-/serviceAccounts/.*:generateAccessToken",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "accessToken": "chat-bot-tok",
+                "expireTime": "2026-08-25T12:00:00Z"
+            })))
+            .mount(&server)
+            .await;
+
+        let mut src = MetadataTokenSource::new();
+        src.metadata_base = server.uri();
+        src.iam_credentials_base = server.uri();
+
+        let token = src
+            .get_token(&reqwest::Client::new())
+            .await
+            .expect("should mint a chat.bot token");
+        assert_eq!(token, "chat-bot-tok");
+    }
+
+    #[test]
+    fn from_parts_use_adc_toggles_metadata_source() {
+        let with = GoogleChatAdapter::from_parts(None, None, None, None, true);
+        assert!(with.metadata_source.is_some(), "use_adc=true → ADC source");
+        let without = GoogleChatAdapter::from_parts(None, None, None, None, false);
+        assert!(
+            without.metadata_source.is_none(),
+            "use_adc=false → no ADC source"
+        );
+    }
+
+    #[tokio::test]
+    async fn adc_takes_precedence_over_static_access_token() {
+        use wiremock::matchers::{method, path, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/computeMetadata/v1/instance/service-accounts/default/email",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("openab-host@dev-seba.iam.gserviceaccount.com"),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/computeMetadata/v1/instance/service-accounts/default/token",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "base-tok", "expires_in": 3600
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(
+                r"/v1/projects/-/serviceAccounts/.*:generateAccessToken",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "accessToken": "chat-bot-tok"
+            })))
+            .mount(&server)
+            .await;
+
+        // Adapter has BOTH an ADC source and a static token; ADC must win.
+        let mut adapter =
+            GoogleChatAdapter::from_parts(None, None, Some("static-tok".into()), None, true);
+        if let Some(ref mut src) = adapter.metadata_source {
+            src.metadata_base = server.uri();
+            src.iam_credentials_base = server.uri();
+        }
+        let token = adapter.get_token().await.expect("a token");
+        assert_eq!(token, "chat-bot-tok", "ADC should win over static token");
     }
 
     // --- Bot filtering logic test ---
